@@ -35,7 +35,14 @@ setup-secureboot)
 
     # Install the surface secureboot certificate
     echo "${SB_KEY}" | base64 -d > pkg/fedora/kernel-surface/secureboot/MOK.key
-    cp pkg/keys/surface.crt pkg/fedora/kernel-surface/secureboot/MOK.crt
+
+    # Forks cannot use the linux-surface key, so allow a custom certificate
+    # (base64-encoded PEM) to be provided next to the custom key.
+    if [ -n "${SB_CERT:-}" ]; then
+        echo "${SB_CERT}" | base64 -d > pkg/fedora/kernel-surface/secureboot/MOK.crt
+    else
+        cp pkg/keys/surface.crt pkg/fedora/kernel-surface/secureboot/MOK.crt
+    fi
     ;;
 build-packages)
     pushd pkg/fedora/kernel-surface || exit 1

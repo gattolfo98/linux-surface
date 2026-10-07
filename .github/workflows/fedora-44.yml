@@ -1,13 +1,13 @@
-name: Fedora 43
+name: Fedora 44
 
 env:
-  FEDORA: 43
+  FEDORA: 44
   GPG_KEY_ID: 56C464BAAC421453
 
 on:
   push:
     tags:
-      - 'fedora-43-*'
+      - 'fedora-44-*'
 
   repository_dispatch:
   workflow_dispatch:
