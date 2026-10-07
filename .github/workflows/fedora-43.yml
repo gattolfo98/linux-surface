@@ -13,6 +13,9 @@ on:
     # cannot be pushed directly).
     branches:
       - 'release/fedora-43'
+      # Test builds of feature branches, published as prereleases named
+      # after the branch (see "Determine release tag").
+      - 'sp8-camera'
 
   repository_dispatch:
   workflow_dispatch:
@@ -117,8 +120,15 @@ jobs:
             version=$(sed -n 's/^PACKAGE_TAG = "kernel-\([0-9.]*\)-.*"$/\1/p' "${script}")
             release=$(sed -n 's/^PACKAGE_RELEASE = "\([0-9]*\)"$/\1/p' "${script}")
             tag="fedora-${FEDORA}-${version}-${release}"
+            branch="${GITHUB_REF#refs/heads/}"
+            if [[ "${branch}" != release/* ]]; then
+              # Never overwrite a real release with a test build
+              tag="${tag}-${branch//\//-}"
+              prerelease="--prerelease"
+            fi
           fi
           echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "prerelease=${prerelease:-}" >> "${GITHUB_OUTPUT}"
 
       - name: Download artifacts
         uses: actions/download-artifact@v8
@@ -130,12 +140,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.LINUX_SURFACE_BOT_TOKEN || secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.tag.outputs.tag }}
+          PRERELEASE: ${{ steps.tag.outputs.prerelease }}
         run: |
           if gh release view "${TAG}" -R "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
             gh release upload "${TAG}" ./*-latest/* --clobber -R "${GITHUB_REPOSITORY}"
           else
             gh release create "${TAG}" ./*-latest/* -R "${GITHUB_REPOSITORY}" \
-              --target "${GITHUB_SHA}" --title "${TAG}" \
+              --target "${GITHUB_SHA}" --title "${TAG}" ${PRERELEASE} \
               --notes "linux-surface kernel for Fedora ${FEDORA}."
           fi
 
