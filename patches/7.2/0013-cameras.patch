@@ -1068,3 +1068,572 @@ index 52357db37..1aa595cbb 100644
 -- 
 2.43.0
 
+From 77fab7a249ed71c3527519c7b2ad04c4acd4bd7a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 18:25:50 +0900
+Subject: [PATCH] media: i2c: ov5693: Reprogram the sensor mode when starting a
+ stream
+
+The mode registers (crop, output size, binning) are only written by
+ov5693_sensor_init(), which runs from the runtime PM resume callback.
+With the 1s autosuspend delay the sensor often stays powered between
+two streams, so a format set in that window never reaches the sensor:
+the receiver then expects a different frame size than the one the
+sensor sends.
+
+This is what happens with PipeWire/libcamera, which typically probe a
+format, stop and restart with another one. The result is one or two
+frames followed by a black picture (or CSI-2 frame errors on IPU6).
+
+Write the mode registers again right before enabling the stream.
+
+Link: https://github.com/linux-surface/linux-surface/wiki/Camera-Support
+Patchset: cameras
+---
+ drivers/media/i2c/ov5693.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/drivers/media/i2c/ov5693.c b/drivers/media/i2c/ov5693.c
+index 02236f3db..7aa4861f6 100644
+--- a/drivers/media/i2c/ov5693.c
++++ b/drivers/media/i2c/ov5693.c
+@@ -976,6 +976,18 @@ static int ov5693_s_stream(struct v4l2_subdev *sd, int enable)
+ 			return ret;
+ 
+ 		mutex_lock(&ov5693->lock);
++		/*
++		 * The mode registers are otherwise only written when the
++		 * sensor is powered up. With runtime PM autosuspend the sensor
++		 * may still be powered from a previous stream, in which case a
++		 * format change made since then would never reach the sensor.
++		 */
++		ret = ov5693_mode_configure(ov5693);
++		if (ret) {
++			mutex_unlock(&ov5693->lock);
++			goto err_power_down;
++		}
++
+ 		ret = __v4l2_ctrl_handler_setup(&ov5693->ctrls.handler);
+ 		if (ret) {
+ 			mutex_unlock(&ov5693->lock);
+-- 
+2.43.0
+
+From a6c0ab75a1462c4896d48cef3e5f3c61f595ad07 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 18:26:25 +0900
+Subject: [PATCH] media: i2c: ov5693: Gate the MIPI clock lane for
+ non-continuous clock
+
+The driver never touches MIPI_CTRL00 (0x4800), so the sensor always runs
+its MIPI clock lane continuously. The IPU3 CIO2 receiver copes with
+that, but the IPU6 found in the Surface Pro 8 (and the Pro 7+, Pro 9 and
+Go 4) does not: the sensor reports streaming, yet the CSI-2 receiver
+gets no packets, so capture times out ("stream stop time out") or, at
+best, works once after a cold boot and then fails.
+
+The Windows driver programs MIPI_CTRL00 = 0x2d on these devices, and
+bit 5 (clock lane gate) alone turned out to be what the IPU6 needs.
+
+Parse the "clock-noncontinuous" endpoint property and set the clock lane
+gate bit before starting the stream when it is present. Systems that do
+not ask for a non-continuous clock keep the register untouched.
+
+Link: https://github.com/linux-surface/linux-surface/issues/1893
+Link: https://github.com/linux-surface/linux-surface/pull/2171
+Link: https://lkml.iu.edu/2607.2/08163.html
+Patchset: cameras
+---
+ drivers/media/i2c/ov5693.c | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/drivers/media/i2c/ov5693.c b/drivers/media/i2c/ov5693.c
+index 7aa4861f6..9e8ce683e 100644
+--- a/drivers/media/i2c/ov5693.c
++++ b/drivers/media/i2c/ov5693.c
+@@ -98,6 +98,10 @@
+ #define OV5693_ISP_CTRL2_REG			CCI_REG8(0x5002)
+ #define OV5693_ISP_SCALE_ENABLE			BIT(7)
+ 
++/* MIPI */
++#define OV5693_MIPI_CTRL00_REG			CCI_REG8(0x4800)
++#define OV5693_MIPI_CTRL00_CLK_LANE_GATE	BIT(5)
++
+ /* Pixel Array */
+ #define OV5693_NATIVE_WIDTH			2624
+ #define OV5693_NATIVE_HEIGHT			1956
+@@ -144,6 +148,9 @@ struct ov5693_device {
+ 	struct regulator_bulk_data supplies[OV5693_NUM_SUPPLIES];
+ 	struct clk *xvclk;
+ 
++	/* Gate the MIPI clock lane between packets (non-continuous clock) */
++	bool noncontinuous_clock;
++
+ 	struct ov5693_mode {
+ 		struct v4l2_rect crop;
+ 		struct v4l2_mbus_framefmt format;
+@@ -611,6 +618,16 @@ static int ov5693_enable_streaming(struct ov5693_device *ov5693, bool enable)
+ {
+ 	int ret = 0;
+ 
++	/*
++	 * The software reset in ov5693_sensor_init() puts MIPI_CTRL00 back to
++	 * its power-on default (free running clock lane), so gate the clock
++	 * lane right before starting the stream when it has been requested.
++	 */
++	if (enable && ov5693->noncontinuous_clock)
++		cci_update_bits(ov5693->regmap, OV5693_MIPI_CTRL00_REG,
++				OV5693_MIPI_CTRL00_CLK_LANE_GATE,
++				OV5693_MIPI_CTRL00_CLK_LANE_GATE, &ret);
++
+ 	cci_write(ov5693->regmap, OV5693_SW_STREAM_REG,
+ 		  enable ? OV5693_START_STREAMING : OV5693_STOP_STREAMING,
+ 		  &ret);
+@@ -1271,6 +1288,11 @@ static int ov5693_check_hwcfg(struct ov5693_device *ov5693)
+ 		goto out_free_bus_cfg;
+ 	}
+ 
++	ov5693->noncontinuous_clock = bus_cfg.bus.mipi_csi2.flags &
++				      V4L2_MBUS_CSI2_NONCONTINUOUS_CLOCK;
++	if (ov5693->noncontinuous_clock)
++		dev_dbg(ov5693->dev, "using non-continuous MIPI clock\n");
++
+ out_free_bus_cfg:
+ 	v4l2_fwnode_endpoint_free(&bus_cfg);
+ 
+-- 
+2.43.0
+
+From e97514c94ce74a0860da240b393bac7519cad31f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 18:27:38 +0900
+Subject: [PATCH] media: ipu-bridge: Request non-continuous clock for ov5693 on
+ IPU6
+
+The IPU6 CSI-2 receiver of the Surface Pro 7+/8 (Tiger Lake), Pro 9
+(Alder Lake-P) and Go 4 (Alder Lake-N) does not lock onto the free
+running clock lane the ov5693 uses by default: the front camera powers
+up and claims to stream, but capture times out.
+
+Add a "clock-noncontinuous" property to the sensor endpoint for the
+ov5693 (INT33BE and OVTI5693) when it is connected to one of these
+IPUs, so the sensor driver gates its clock lane. The IPU3 CIO2 and the
+other sensors are left alone.
+
+The endpoint properties are now filled with a running index, so that
+optional entries do not leave a hole that would terminate the list
+early (e.g. a sensor without link frequencies). The property name is
+stored in struct ipu_property_names like the others, so that it stays
+valid as long as the software nodes.
+
+Link: https://github.com/linux-surface/linux-surface/issues/1893
+Link: https://lkml.iu.edu/2607.2/08163.html
+Patchset: cameras
+---
+ drivers/media/pci/intel/ipu-bridge.c | 54 +++++++++++++++++++++++++---
+ include/media/ipu-bridge.h           |  3 +-
+ 2 files changed, 52 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/media/pci/intel/ipu-bridge.c b/drivers/media/pci/intel/ipu-bridge.c
+index 1aa595cbb..e930f39e6 100644
+--- a/drivers/media/pci/intel/ipu-bridge.c
++++ b/drivers/media/pci/intel/ipu-bridge.c
+@@ -8,6 +8,7 @@
+ #include <linux/dmi.h>
+ #include <linux/i2c.h>
+ #include <linux/mei_cl_bus.h>
++#include <linux/pci.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/property.h>
+@@ -163,6 +164,30 @@ static const struct ipu_property_names prop_names = {
+ 	.data_lanes = "data-lanes",
+ 	.remote_endpoint = "remote-endpoint",
+ 	.link_frequencies = "link-frequencies",
++	.clock_noncontinuous = "clock-noncontinuous",
++};
++
++/*
++ * Sensors that must gate their MIPI clock lane (non-continuous clock mode)
++ * when they are connected to one of the IPUs listed below. The IPU6 CSI-2
++ * receiver of these platforms does not lock onto the free running clock lane
++ * that the sensor drivers use by default, and capture times out.
++ */
++static const char * const ipu_noncontinuous_clock_sensors[] = {
++	/* Omnivision OV5693 (Surface Pro 7+, Pro 8, Go 4) */
++	"INT33BE",
++	/* Omnivision OV5693 (Surface Pro 9) */
++	"OVTI5693",
++};
++
++static const struct pci_device_id ipu_noncontinuous_clock_ipus[] = {
++	/* IPU6, Tiger Lake (Surface Pro 7+, Pro 8) */
++	{ PCI_VDEVICE(INTEL, 0x9a19) },
++	/* IPU6EP, Alder Lake-P (Surface Pro 9) */
++	{ PCI_VDEVICE(INTEL, 0x465d) },
++	/* IPU6EP, Alder Lake-N (Surface Go 4) */
++	{ PCI_VDEVICE(INTEL, 0x462e) },
++	{ }
+ };
+ 
+ static const char * const ipu_vcm_types[] = {
+@@ -425,6 +450,19 @@ int ipu_bridge_parse_ssdb(struct acpi_device *adev, struct ipu_sensor *sensor)
+ }
+ EXPORT_SYMBOL_NS_GPL(ipu_bridge_parse_ssdb, "INTEL_IPU_BRIDGE");
+ 
++static bool ipu_bridge_needs_noncontinuous_clock(
++	struct ipu_bridge *bridge,
++	const struct ipu_sensor_config *cfg)
++{
++	if (!dev_is_pci(bridge->dev) ||
++	    !pci_match_id(ipu_noncontinuous_clock_ipus, to_pci_dev(bridge->dev)))
++		return false;
++
++	return match_string(ipu_noncontinuous_clock_sensors,
++			    ARRAY_SIZE(ipu_noncontinuous_clock_sensors),
++			    cfg->hid) >= 0;
++}
++
+ static void ipu_bridge_create_fwnode_properties(
+ 	struct ipu_sensor *sensor,
+ 	struct ipu_bridge *bridge,
+@@ -432,6 +470,7 @@ static void ipu_bridge_create_fwnode_properties(
+ {
+ 	struct ipu_property_names *names = &sensor->prop_names;
+ 	struct software_node *nodes = sensor->swnodes;
++	unsigned int ep = 0;
+ 
+ 	sensor->prop_names = prop_names;
+ 
+@@ -489,22 +528,29 @@ static void ipu_bridge_create_fwnode_properties(
+ 			PROPERTY_ENTRY_REF_ARRAY("lens-focus", sensor->vcm_ref);
+ 	}
+ 
+-	sensor->ep_properties[0] = PROPERTY_ENTRY_U32(
++	sensor->ep_properties[ep++] = PROPERTY_ENTRY_U32(
+ 					sensor->prop_names.bus_type,
+ 					V4L2_FWNODE_BUS_TYPE_CSI2_DPHY);
+-	sensor->ep_properties[1] = PROPERTY_ENTRY_U32_ARRAY_LEN(
++	sensor->ep_properties[ep++] = PROPERTY_ENTRY_U32_ARRAY_LEN(
+ 					sensor->prop_names.data_lanes,
+ 					bridge->data_lanes, sensor->lanes);
+-	sensor->ep_properties[2] = PROPERTY_ENTRY_REF_ARRAY(
++	sensor->ep_properties[ep++] = PROPERTY_ENTRY_REF_ARRAY(
+ 					sensor->prop_names.remote_endpoint,
+ 					sensor->local_ref);
+ 
+ 	if (cfg->nr_link_freqs > 0)
+-		sensor->ep_properties[3] = PROPERTY_ENTRY_U64_ARRAY_LEN(
++		sensor->ep_properties[ep++] = PROPERTY_ENTRY_U64_ARRAY_LEN(
+ 			sensor->prop_names.link_frequencies,
+ 			cfg->link_freqs,
+ 			cfg->nr_link_freqs);
+ 
++	if (ipu_bridge_needs_noncontinuous_clock(bridge, cfg)) {
++		dev_dbg(bridge->dev, "%s: requesting non-continuous MIPI clock\n",
++			cfg->hid);
++		sensor->ep_properties[ep++] = PROPERTY_ENTRY_BOOL(
++			sensor->prop_names.clock_noncontinuous);
++	}
++
+ 	sensor->ipu_properties[0] = PROPERTY_ENTRY_U32_ARRAY_LEN(
+ 					sensor->prop_names.data_lanes,
+ 					bridge->data_lanes, sensor->lanes);
+diff --git a/include/media/ipu-bridge.h b/include/media/ipu-bridge.h
+index 16fac7654..411c84eb2 100644
+--- a/include/media/ipu-bridge.h
++++ b/include/media/ipu-bridge.h
+@@ -102,6 +102,7 @@ struct ipu_property_names {
+ 	char data_lanes[11];
+ 	char remote_endpoint[16];
+ 	char link_frequencies[17];
++	char clock_noncontinuous[20];
+ };
+ 
+ struct ipu_node_names {
+@@ -141,7 +142,7 @@ struct ipu_sensor {
+ 	const char *vcm_type;
+ 
+ 	struct ipu_property_names prop_names;
+-	struct property_entry ep_properties[5];
++	struct property_entry ep_properties[6];
+ 	struct property_entry dev_properties[5];
+ 	struct property_entry ipu_properties[3];
+ 	struct property_entry ivsc_properties[1];
+-- 
+2.43.0
+
+From 4c12891ba80cf41734909e4ba2f402464139139c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 18:28:37 +0900
+Subject: [PATCH] media: i2c: ov13858: Wait for the IPU bridge and tidy up
+ power handling
+
+The Surface Pro 8 uses the same rear camera module and the same INT3472
+power layout as the Surface Pro 9 (avdd on GPIO type 0x0b, a second
+rail on GPIO type 0x08, reset, privacy LED, clock enabled through the
+_DSM), so the power handling added for the Pro 9 is what makes the
+rear camera of the Pro 8 work as well. Clean it up a bit:
+
+ - Defer probing until the fwnode graph exists. On these devices it is
+   built by the IPU bridge when the IPU driver probes, together with the
+   rotation, orientation and clock-frequency properties. Without this,
+   the sensor may register before the bridge has run and then lacks the
+   orientation/rotation controls that libcamera uses to tell the front
+   and rear cameras apart. Other sensor drivers used with the bridge
+   (ov5693, ov8865, ov2740, ...) do the same.
+
+ - Enable the clock obtained by devm_v4l2_sensor_clk_get() instead of
+   requesting the same clock a second time as "xvclk".
+
+ - Turn the messages printed on every runtime suspend/resume into debug
+   messages and drop the chip ID debug output.
+
+ - Include the GPIO and regulator consumer headers explicitly.
+
+Link: https://github.com/linux-surface/linux-surface/issues/1893
+Patchset: cameras
+---
+ drivers/media/i2c/ov13858.c | 76 +++++++++++++++++--------------------
+ 1 file changed, 35 insertions(+), 41 deletions(-)
+
+diff --git a/drivers/media/i2c/ov13858.c b/drivers/media/i2c/ov13858.c
+index 015493a16..91b1ce97b 100644
+--- a/drivers/media/i2c/ov13858.c
++++ b/drivers/media/i2c/ov13858.c
+@@ -4,9 +4,11 @@
+ #include <linux/acpi.h>
+ #include <linux/delay.h>
+ #include <linux/clk.h>
++#include <linux/gpio/consumer.h>
+ #include <linux/i2c.h>
+ #include <linux/module.h>
+ #include <linux/pm_runtime.h>
++#include <linux/regulator/consumer.h>
+ #include <media/v4l2-ctrls.h>
+ #include <media/v4l2-device.h>
+ #include <media/v4l2-event.h>
+@@ -120,10 +122,14 @@ struct ov13858_mode {
+ 	struct ov13858_reg_list reg_list;
+ };
+ 
+-// Or use standard names that might be more correct:
++/*
++ * Supplies provided by the INT3472 discrete power controller on the Surface
++ * Pro 8/9: "avdd" (GPIO type 0x0b) and a second rail (GPIO type 0x08).
++ * Systems that power the sensor through ACPI get dummy regulators.
++ */
+ static const char * const ov13858_supply_names[] = {
+-	"avdd",    // Analog voltage
+-	"pwr1",    // Digital core voltage
++	"avdd",
++	"pwr1",
+ };
+ 
+ #define OV13858_NUM_SUPPLIES ARRAY_SIZE(ov13858_supply_names)
+@@ -1057,7 +1063,6 @@ struct ov13858 {
+ 
+ 	struct regulator_bulk_data supplies[OV13858_NUM_SUPPLIES];
+ 	struct gpio_desc *reset;
+-	struct clk *xvclk;
+ 
+ 	/* Mutex for serialized access */
+ 	struct mutex mutex;
+@@ -1065,7 +1070,6 @@ struct ov13858 {
+ 
+ #define to_ov13858(_sd)	container_of(_sd, struct ov13858, sd)
+ 
+-
+ static int ov13858_get_regulators(struct ov13858 *ov13858)
+ {
+ 	unsigned int i;
+@@ -1081,57 +1085,44 @@ static int ov13858_sensor_powerup(struct ov13858 *ov13858)
+ {
+ 	int ret;
+ 
+-	dev_info(ov13858->dev, "Powering up sensor\n");
++	dev_dbg(ov13858->dev, "powering up sensor\n");
+ 
+-	/* Assert reset */
++	/* Keep the sensor in reset while the supplies come up */
+ 	gpiod_set_value_cansleep(ov13858->reset, 1);
+ 
+-	/* Enable clock FIRST - sensor needs clock to communicate */
+-	ret = clk_prepare_enable(ov13858->xvclk);
++	ret = clk_prepare_enable(ov13858->clk);
+ 	if (ret) {
+-		dev_err(ov13858->dev, "Failed to enable clock: %d\n", ret);
++		dev_err(ov13858->dev, "failed to enable clock: %d\n", ret);
+ 		return ret;
+ 	}
+-	dev_info(ov13858->dev, "Clock enabled\n");
+ 
+-	/* Enable regulators */
+ 	ret = regulator_bulk_enable(OV13858_NUM_SUPPLIES, ov13858->supplies);
+ 	if (ret) {
+-		dev_err(ov13858->dev, "Failed to enable regulators: %d\n", ret);
+-		clk_disable_unprepare(ov13858->xvclk);
++		dev_err(ov13858->dev, "failed to enable regulators: %d\n", ret);
++		clk_disable_unprepare(ov13858->clk);
+ 		return ret;
+ 	}
+ 
+-	dev_info(ov13858->dev, "Regulators enabled\n");
+-
+-	/* Wait for power to stabilize */
++	/* Wait for the supplies to stabilize */
+ 	usleep_range(5000, 10000);
+ 
+-	/* De-assert reset */
+ 	gpiod_set_value_cansleep(ov13858->reset, 0);
+ 
+-	/* Wait for sensor to boot */
++	/* Wait for the sensor to boot */
+ 	msleep(20);
+ 
+-	dev_info(ov13858->dev, "Reset de-asserted, sensor should be ready\n");
+-
+ 	return 0;
+ }
+ 
+ static void ov13858_sensor_powerdown(struct ov13858 *ov13858)
+ {
+-	dev_info(ov13858->dev, "Powering down sensor\n");
++	dev_dbg(ov13858->dev, "powering down sensor\n");
+ 
+-	/* Assert reset to put sensor in reset state */
+ 	gpiod_set_value_cansleep(ov13858->reset, 1);
+ 
+-	/* Disable regulators */
+ 	regulator_bulk_disable(OV13858_NUM_SUPPLIES, ov13858->supplies);
+-	dev_info(ov13858->dev, "Regulators disabled\n");
+ 
+-	/* Disable clock */
+-	clk_disable_unprepare(ov13858->xvclk);
+-	dev_info(ov13858->dev, "Clock disabled\n");
++	clk_disable_unprepare(ov13858->clk);
+ }
+ 
+ static int __maybe_unused ov13858_suspend(struct device *dev)
+@@ -1621,11 +1612,8 @@ static int ov13858_identify_module(struct ov13858 *ov13858)
+ 	int ret;
+ 	u32 val;
+ 
+-	dev_info(ov13858->dev, "Attempting to read chip ID from register 0x300a\n");
+ 	ret = ov13858_read_reg(ov13858, OV13858_REG_CHIP_ID,
+ 			       OV13858_REG_VALUE_24BIT, &val);
+-	dev_info(ov13858->dev, "Chip ID read result: ret=%d, val=0x%06x (expected 0x%06x)\n",
+-	         ret, val, OV13858_CHIP_ID);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1635,7 +1623,6 @@ static int ov13858_identify_module(struct ov13858 *ov13858)
+ 		return -EIO;
+ 	}
+ 
+-	dev_info(ov13858->dev, "Chip ID verified successfully!\n");
+ 	return 0;
+ }
+ 
+@@ -1784,10 +1771,23 @@ static void ov13858_free_controls(struct ov13858 *ov13858)
+ 
+ static int ov13858_probe(struct i2c_client *client)
+ {
++	struct fwnode_handle *endpoint;
+ 	struct ov13858 *ov13858;
+ 	unsigned long freq;
+ 	int ret;
+ 
++	/*
++	 * On systems shipped with Windows the fwnode graph (and the rotation
++	 * and orientation properties) is created by the IPU bridge, wait for
++	 * it so that the sensor is not registered without them.
++	 */
++	endpoint = fwnode_graph_get_next_endpoint(dev_fwnode(&client->dev),
++						  NULL);
++	if (!endpoint)
++		return dev_err_probe(&client->dev, -EPROBE_DEFER,
++				     "waiting for fwnode graph endpoint\n");
++	fwnode_handle_put(endpoint);
++
+ 	ov13858 = devm_kzalloc(&client->dev, sizeof(*ov13858), GFP_KERNEL);
+ 	if (!ov13858)
+ 		return -ENOMEM;
+@@ -1805,19 +1805,13 @@ static int ov13858_probe(struct i2c_client *client)
+ 				     "external clock %lu is not supported\n",
+ 				     freq);
+ 
+-	/* Get the external clock */
+-	ov13858->xvclk = devm_clk_get_optional(ov13858->dev, "xvclk");
+-	if (IS_ERR(ov13858->xvclk))
+-		return dev_err_probe(ov13858->dev, PTR_ERR(ov13858->xvclk),
+-		       "failed to get xvclk\n");
+-
+ 	/* Initialize subdev */
+ 	v4l2_i2c_subdev_init(&ov13858->sd, client, &ov13858_subdev_ops);
+ 
+ 	ret = ov13858_get_regulators(ov13858);
+ 	if (ret)
+ 		return dev_err_probe(ov13858->dev, ret,
+-		       "Error fetching regulators\n");
++				     "failed to get regulators\n");
+ 
+ 	ret = ov13858_get_gpios(ov13858);
+ 	if (ret)
+@@ -1825,13 +1819,13 @@ static int ov13858_probe(struct i2c_client *client)
+ 
+ 	ret = ov13858_sensor_powerup(ov13858);
+ 	if (ret)
+-		return ret;  // No cleanup needed yet, devm handles GPIOs/regulators
++		return ret;
+ 
+ 	/* Check module identity */
+ 	ret = ov13858_identify_module(ov13858);
+ 	if (ret) {
+ 		dev_err(ov13858->dev, "failed to find sensor: %d\n", ret);
+-		goto error_power_off;  // Now we need to power down
++		goto error_power_off;
+ 	}
+ 
+ 	/* Set default mode to max resolution */
+-- 
+2.43.0
+
+From 0c6fe66de4effbbd5a7e2e52a4e633b9d811d721 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 18:35:14 +0900
+Subject: [PATCH] media: ipu-bridge: Fix the link frequencies of the ov13858
+
+The entry added for the Surface Pro 9 rear camera passes the number of
+CSI-2 lanes (4) as the number of link frequencies, while only one
+frequency is listed and the table has room for three. The bridge then
+copies four values into the "link-frequencies" endpoint property,
+reading past the end of the entry into the next one.
+
+List the two link frequencies the ov13858 driver supports instead
+(540 MHz for the full resolution modes, 270 MHz for the binned ones).
+The Surface Pro 8 uses the same rear camera module (OVTID858).
+
+Patchset: cameras
+---
+ drivers/media/pci/intel/ipu-bridge.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/pci/intel/ipu-bridge.c b/drivers/media/pci/intel/ipu-bridge.c
+index e930f39e6..044a21eb3 100644
+--- a/drivers/media/pci/intel/ipu-bridge.c
++++ b/drivers/media/pci/intel/ipu-bridge.c
+@@ -64,8 +64,8 @@ static const struct ipu_sensor_config ipu_supported_sensors[] = {
+ 	IPU_SENSOR_CONFIG("INT33F0", 1, 384000000),
+ 	/* Omnivision OV5693 - Surface Pro 9 */
+ 	IPU_SENSOR_CONFIG("OVTI5693", 1, 419200000),
+-	/* Omnivision OV13858 - Surface Pro 9 */
+-	IPU_SENSOR_CONFIG("OVTID858", 4, 540000000),
++	/* Omnivision OV13858 - Surface Pro 8, Pro 9 */
++	IPU_SENSOR_CONFIG("OVTID858", 2, 540000000, 270000000),
+ 	/* Omnivision OV2740 */
+ 	IPU_SENSOR_CONFIG("INT3474", 1, 180000000),
+ 	/* Omnivision OV5670 */
+-- 
+2.43.0
+
