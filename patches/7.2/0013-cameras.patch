@@ -678,7 +678,7 @@ index 3b7ba88fd..440888507 100644
 -- 
 2.43.0
 
-From 636b74bb000f18d5a381af5a2706be00f9de97a6 Mon Sep 17 00:00:00 2001
+From 6e1f671f6e4389a1392be97780a9f3ed6de79847 Mon Sep 17 00:00:00 2001
 From: Tooraj Taraz <tooraj.taraz@yahoo.com>
 Date: Wed, 31 Dec 2025 00:35:50 +0100
 Subject: [PATCH] Add camera support for Surface Pro 9
@@ -687,7 +687,8 @@ Experimental camera support for the Surface Pro 9.
 
 [rebased onto v7.2: GPIO type 0x10 is now handled upstream as
  INT3472_GPIO_TYPE_DOVDD, so only the extra 0x08 power rail is kept,
- as INT3472_GPIO_TYPE_SURFACE_PWR1. Debug messages dropped.]
+ as INT3472_GPIO_TYPE_SURFACE_PWR1, and registered through the same
+ regulator path as DOVDD. Debug messages dropped.]
 
 Link: https://github.com/linux-surface/linux-surface/pull/1867
 Patchset: cameras
@@ -695,9 +696,9 @@ Patchset: cameras
  drivers/media/i2c/ov13858.c                   | 158 +++++++++++++++++-
  drivers/media/i2c/ov5693.c                    |   1 +
  drivers/media/pci/intel/ipu-bridge.c          |   4 +
- drivers/platform/x86/intel/int3472/discrete.c |  13 ++
+ drivers/platform/x86/intel/int3472/discrete.c |   7 +
  include/linux/platform_data/x86/int3472.h     |   1 +
- 5 files changed, 175 insertions(+), 2 deletions(-)
+ 5 files changed, 169 insertions(+), 2 deletions(-)
 
 diff --git a/drivers/media/i2c/ov13858.c b/drivers/media/i2c/ov13858.c
 index 09d58e8b1..015493a16 100644
@@ -974,43 +975,37 @@ index 510c0eca4..52357db37 100644
  	IPU_SENSOR_CONFIG("INT3474", 1, 180000000),
  	/* Omnivision OV5670 */
 diff --git a/drivers/platform/x86/intel/int3472/discrete.c b/drivers/platform/x86/intel/int3472/discrete.c
-index 115bb3757..ae695e2e0 100644
+index 115bb3757..93e0ae373 100644
 --- a/drivers/platform/x86/intel/int3472/discrete.c
 +++ b/drivers/platform/x86/intel/int3472/discrete.c
-@@ -237,6 +237,11 @@ static void int3472_get_con_id_and_polarity(struct int3472_discrete_device *int3
- 		/* Setups using a handshake pin need 25 ms enable delay */
- 		*enable_time_us = 25 * USEC_PER_MSEC;
+@@ -227,6 +227,11 @@ static void int3472_get_con_id_and_polarity(struct int3472_discrete_device *int3
+ 		*con_id = "avdd";
+ 		*gpio_flags = GPIO_ACTIVE_HIGH;
  		break;
 +	case INT3472_GPIO_TYPE_SURFACE_PWR1:
 +		/* Additional power rail found on Surface Pro 9 */
 +		*con_id = "pwr1";
 +		*gpio_flags = GPIO_ACTIVE_HIGH;
 +		break;
- 	default:
- 		*con_id = "unknown";
+ 	case INT3472_GPIO_TYPE_DOVDD:
+ 		*con_id = "dovdd";
  		*gpio_flags = GPIO_ACTIVE_HIGH;
-@@ -345,6 +350,7 @@ static int skl_int3472_handle_gpio_resources(struct acpi_resource *ares,
+@@ -344,6 +349,7 @@ static int skl_int3472_handle_gpio_resources(struct acpi_resource *ares,
+ 	case INT3472_GPIO_TYPE_STROBE:
  	case INT3472_GPIO_TYPE_POWER_ENABLE:
  	case INT3472_GPIO_TYPE_DOVDD:
- 	case INT3472_GPIO_TYPE_HANDSHAKE:
 +	case INT3472_GPIO_TYPE_SURFACE_PWR1:
+ 	case INT3472_GPIO_TYPE_HANDSHAKE:
  		gpio = skl_int3472_gpiod_get_from_temp_lookup(int3472, agpio, con_id, gpio_flags);
  		if (IS_ERR(gpio)) {
- 			ret = PTR_ERR(gpio);
-@@ -376,6 +382,13 @@ static int skl_int3472_handle_gpio_resources(struct acpi_resource *ares,
- 			if (ret)
- 				err_msg = "Failed to register regulator\n";
- 
-+			break;
+@@ -370,6 +376,7 @@ static int skl_int3472_handle_gpio_resources(struct acpi_resource *ares,
+ 			second_sensor = int3472->quirks.avdd_second_sensor;
+ 			fallthrough;
+ 		case INT3472_GPIO_TYPE_DOVDD:
 +		case INT3472_GPIO_TYPE_SURFACE_PWR1:
-+			ret = skl_int3472_register_regulator(int3472, gpio, enable_time_us,
-+							     con_id, NULL);
-+			if (ret)
-+				err_msg = "Failed to register regulator\n";
-+
- 			break;
- 		default: /* Never reached */
- 			ret = -EINVAL;
+ 		case INT3472_GPIO_TYPE_HANDSHAKE:
+ 			ret = skl_int3472_register_regulator(int3472, gpio, enable_time_us,
+ 							     con_id, second_sensor);
 diff --git a/include/linux/platform_data/x86/int3472.h b/include/linux/platform_data/x86/int3472.h
 index a73841dfa..a2ab96e43 100644
 --- a/include/linux/platform_data/x86/int3472.h
@@ -1026,7 +1021,7 @@ index a73841dfa..a2ab96e43 100644
 -- 
 2.43.0
 
-From 326684d53a90f2cf6b7a4b85f106cb8377f28918 Mon Sep 17 00:00:00 2001
+From aac69367a59d89ea9b84d0c93cb85717289ba915 Mon Sep 17 00:00:00 2001
 From: gabrielstedman <gabrielstedman@users.noreply.github.com>
 Date: Fri, 13 Mar 2026 08:52:07 +0000
 Subject: [PATCH] media: ipu-bridge: Add front camera rotation quirks for
