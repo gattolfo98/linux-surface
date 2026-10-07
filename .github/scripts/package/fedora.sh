@@ -54,12 +54,28 @@ build-packages)
     # Build source RPM packages
     python3 build-linux-surface.py --mode srpm --ark-dir kernel-ark --outdir srpm
 
+    # Fail loudly instead of silently producing no packages
+    echo "Source packages:"
+    find srpm -type f -print
+    if ! find srpm -name '*.src.rpm' -type f | grep -q .; then
+        echo "ERROR: no source RPM was generated. kernel-ark output:"
+        find kernel-ark/redhat/rpm -maxdepth 3 -print 2>/dev/null | head -n 50
+        exit 1
+    fi
+
     # Remove the kernel-ark tree to get as much free disk space as possible
     rm -rf kernel-ark
 
     # Build binary RPM packages
     find srpm -name '*.src.rpm' -type f -print0 | xargs -0 -I '{}' \
         rpmbuild -rb --define "_topdir ${PWD}/rpmbuild" --define "_rpmdir ${PWD}/out" {}
+
+    echo "Binary packages:"
+    find out -type f -print 2>/dev/null || true
+    if ! find out -name '*.rpm' -type f 2>/dev/null | grep -q .; then
+        echo "ERROR: no binary RPMs were generated"
+        exit 1
+    fi
 
     popd || exit 1
     ;;
