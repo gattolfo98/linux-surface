@@ -1,0 +1,47 @@
+name: Export kernel-ark packaging
+
+# Copies the redhat/ directory of the kernel-ark tag used by the Fedora
+# package to the branch ark/<tag> of this repository. This makes the Fedora
+# packaging (kernel.spec.template, config priorities) available to
+# environments that can reach GitHub but not gitlab.com, e.g. for rebasing
+# the patches in pkg/fedora/kernel-surface/patches onto a new kernel-ark tag.
+
+on:
+  push:
+    branches:
+      - 'tools/export-ark'
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    name: Export redhat/ directory
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Export
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag=$(sed -n 's/^PACKAGE_TAG = "\(.*\)"$/\1/p' pkg/fedora/kernel-surface/build-linux-surface.py)
+          echo "kernel-ark tag: ${tag}"
+
+          git init -q ark
+          git -C ark fetch -q --depth 1 https://gitlab.com/cki-project/kernel-ark "refs/tags/${tag}:refs/tags/${tag}"
+          git -C ark checkout -q "${tag}"
+
+          mkdir export
+          cp -r ark/redhat export/
+          git -C ark log -1 --format='%H %s' > export/ARK_COMMIT
+
+          cd export
+          git init -q
+          git add -A
+          git -c user.name="github-actions" -c user.email="github-actions@users.noreply.github.com" \
+            commit -q -m "kernel-ark ${tag}: redhat/"
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" "HEAD:refs/heads/ark/${tag}"
