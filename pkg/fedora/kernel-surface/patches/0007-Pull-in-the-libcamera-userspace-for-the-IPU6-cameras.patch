@@ -1,0 +1,31 @@
+From 2f1f01b109a02f1098207239bd5b0933cc12c116 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 18:34:06 +0900
+Subject: [PATCH] Pull in the libcamera userspace for the IPU6 cameras
+
+The cameras of the IPU6 based Surface devices (Surface Pro 8, Pro 9)
+are raw sensors: applications can only use them through libcamera and
+its software ISP, normally via the PipeWire camera portal. Pull in the
+PipeWire libcamera plugin and the libcamera IPA modules (which contain
+the software ISP control algorithms) as weak dependencies, so that the
+cameras work out of the box.
+---
+ redhat/kernel.spec.template | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/redhat/kernel.spec.template b/redhat/kernel.spec.template
+index b371a121..9053d9cd 100644
+--- a/redhat/kernel.spec.template
++++ b/redhat/kernel.spec.template
+@@ -1254,6 +1254,8 @@ Requires(pre): %{initrd_prereq}\
+ Requires(pre): ((linux-firmware >= 20150904-56.git6ebf5d57) if linux-firmware)\
+ Recommends: linux-firmware\
+ Recommends: intel-vsc-firmware\
++Recommends: libcamera-ipa\
++Recommends: pipewire-plugin-libcamera\
+ Recommends: iptsd\
+ Recommends: %{package_name}-default-watchdog\
+ Requires(preun): systemd >= 200\
+-- 
+2.43.0
+
