@@ -25,6 +25,16 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v6
 
+      - name: Free disk space
+        run: |
+          # The kernel build tree does not fit in the default free space of
+          # the hosted runners, drop toolchains this job does not use.
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker image prune --all --force > /dev/null || true
+          df -h /
+
       - name: Initialize containers
         run: |
           bash ./.github/scripts/container/create.sh \
@@ -64,7 +74,7 @@ jobs:
           grep -v -E '^\+ |FLAGS=' build.log | cut -c1-220 > short.log || true
           grep -n -E 'error:|Error [0-9]+|\*\*\*|undefined reference|ERROR:|FAILED|CONFLICT|patch failed|Bad exit status|No such file|fatal' short.log \
             | tail -n 30 > errors.txt || true
-          tail -n 40 short.log > tail.txt || true
+          { df -h / | tail -n 1; tail -n 40 short.log; } > tail.txt || true
 
           emit() {
             local msg
