@@ -1026,7 +1026,7 @@ index a73841dfa..a2ab96e43 100644
 -- 
 2.43.0
 
-From c4bc6b394e6ea8f08abeff9a15d2112024e6e6f9 Mon Sep 17 00:00:00 2001
+From 326684d53a90f2cf6b7a4b85f106cb8377f28918 Mon Sep 17 00:00:00 2001
 From: gabrielstedman <gabrielstedman@users.noreply.github.com>
 Date: Fri, 13 Mar 2026 08:52:07 +0000
 Subject: [PATCH] media: ipu-bridge: Add front camera rotation quirks for
@@ -1036,6 +1036,9 @@ On the Surface Pro 8 and 9, camera rotation in `ssdb.degree` is `0` (no
 rotation) but should be `180`. Add these devices to the respective quirk
 list.
 
+[rebased onto v7.2: entries added at the head of the table so the patch
+ does not collide with quirks appended upstream or backported by distros]
+
 Link: https://github.com/linux-surface/kernel/pull/160
 Patchset: cameras
 ---
@@ -1043,13 +1046,13 @@ Patchset: cameras
  1 file changed, 14 insertions(+)
 
 diff --git a/drivers/media/pci/intel/ipu-bridge.c b/drivers/media/pci/intel/ipu-bridge.c
-index 52357db37..8a82fd99e 100644
+index 52357db37..1aa595cbb 100644
 --- a/drivers/media/pci/intel/ipu-bridge.c
 +++ b/drivers/media/pci/intel/ipu-bridge.c
-@@ -138,6 +138,20 @@ static const struct dmi_system_id upside_down_sensor_dmi_ids[] = {
- 		},
- 		.driver_data = "OVTI02C1",
- 	},
+@@ -110,6 +110,20 @@ static const struct ipu_sensor_config ipu_supported_sensors[] = {
+  * without reporting a rotation of 180° in neither the SSDB nor the _PLD.
+  */
+ static const struct dmi_system_id upside_down_sensor_dmi_ids[] = {
 +	{
 +		.matches = {
 +			DMI_MATCH(DMI_SYS_VENDOR, "Microsoft Corporation"),
@@ -1064,9 +1067,9 @@ index 52357db37..8a82fd99e 100644
 +		},
 +		.driver_data = "OVTI5693",
 +	},
- 	{} /* Terminating entry */
- };
- 
+ 	{
+ 		.matches = {
+ 			DMI_EXACT_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
 -- 
 2.43.0
 
