@@ -48,6 +48,8 @@ jobs:
             bash ./.github/scripts/package/fedora.sh setup-secureboot
 
       - name: Build packages
+        # bash (not the default "bash -e") enables pipefail, so failures are not hidden by tee
+        shell: bash
         run: |
           bash ./.github/scripts/container/exec.sh \
             -- \
