@@ -11,6 +11,8 @@ on:
 jobs:
   sync:
     name: Sync with upstream
+    # Needs the linux-surface bot token; skip in forks.
+    if: github.repository == 'linux-surface/linux-surface'
     runs-on: ubuntu-latest
 
     steps:

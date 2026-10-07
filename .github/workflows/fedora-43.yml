@@ -8,6 +8,11 @@ on:
   push:
     tags:
       - 'fedora-43-*'
+    # Pushing this branch builds the commit and publishes it as
+    # fedora-43-<kernel version>-<package release> (useful when tags
+    # cannot be pushed directly).
+    branches:
+      - 'release/fedora-43'
 
   repository_dispatch:
   workflow_dispatch:
@@ -77,12 +82,30 @@ jobs:
 
   release:
     name: Publish release
-    if: github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags/')
+    if: github.event_name == 'push'
     needs: [build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+          else
+            script=pkg/fedora/kernel-surface/build-linux-surface.py
+            version=$(sed -n 's/^PACKAGE_TAG = "kernel-\([0-9.]*\)-.*"$/\1/p' "${script}")
+            release=$(sed -n 's/^PACKAGE_RELEASE = "\([0-9]*\)"$/\1/p' "${script}")
+            tag="fedora-${FEDORA}-${version}-${release}"
+          fi
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
       - name: Download artifacts
         uses: actions/download-artifact@v8
         with:
@@ -90,13 +113,17 @@ jobs:
           path: fedora-${{ env.FEDORA }}-latest
 
       - name: Upload assets
-        uses: svenstaro/upload-release-action@v2
-        with:
-          repo_token: ${{ secrets.LINUX_SURFACE_BOT_TOKEN || secrets.GITHUB_TOKEN }}
-          file: ./*-latest/*
-          tag: ${{ github.ref }}
-          overwrite: true
-          file_glob: true
+        env:
+          GH_TOKEN: ${{ secrets.LINUX_SURFACE_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          if gh release view "${TAG}" -R "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+            gh release upload "${TAG}" ./*-latest/* --clobber -R "${GITHUB_REPOSITORY}"
+          else
+            gh release create "${TAG}" ./*-latest/* -R "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" --title "${TAG}" \
+              --notes "linux-surface kernel for Fedora ${FEDORA}."
+          fi
 
   repo:
     name: Update package repository
@@ -121,7 +148,7 @@ jobs:
       - name: Update repository
         env:
           SURFACEBOT_TOKEN: ${{ secrets.LINUX_SURFACE_BOT_TOKEN }}
-          GIT_REF: ${{ github.ref }}
+          GIT_REF: refs/tags/${{ needs.release.outputs.tag }}
           BRANCH_STAGING: u/staging
         run: |
           bash ./.github/scripts/container/exec.sh \
